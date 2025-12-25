@@ -24,19 +24,21 @@ logger = logging.getLogger(__name__)
 def translate_movie_info(info: MovieInfo):
     """根据配置翻译影片信息"""
     # 翻译标题
-    if info.title and Cfg().translator.fields.title and info.ori_title is None:
-        result = translate(info.title, Cfg().translator.engine, info.actress)
-        if 'trans' in result:
-            info.ori_title = info.title
-            info.title = result['trans']
-            # 如果有的话，附加断句信息
-            if 'orig_break' in result:
-                setattr(info, 'ori_title_break', result['orig_break'])
-            if 'trans_break' in result:
-                setattr(info, 'title_break', result['trans_break'])
-        else:
-            logger.error('翻译标题时出错: ' + result['error'])
-            return False
+    if info.title and Cfg().translator.fields.title:
+        # 如果ori_title已存在但标题与原始标题相同（未翻译），则仍进行翻译
+        if info.ori_title is None or info.ori_title == info.title:
+            result = translate(info.title, Cfg().translator.engine, info.actress)
+            if 'trans' in result:
+                info.ori_title = info.title
+                info.title = result['trans']
+                # 如果有的话，附加断句信息
+                if 'orig_break' in result:
+                    setattr(info, 'ori_title_break', result['orig_break'])
+                if 'trans_break' in result:
+                    setattr(info, 'title_break', result['trans_break'])
+            else:
+                logger.error('翻译标题时出错: ' + result['error'])
+                return False
     # 翻译简介
     if info.plot and Cfg().translator.fields.plot:
         result = translate(info.plot, Cfg().translator.engine, info.actress)
@@ -66,6 +68,11 @@ def translate(texts, engine: Union[
     """
     rtn = {}
     err_msg = ''
+    
+    # 处理engine为None的情况
+    if engine is None:
+        return {'trans': texts}
+    
     if engine.name == 'baidu':
         result = baidu_translate(texts, engine.app_id, engine.api_key)
         if 'error_code' not in result:
@@ -131,6 +138,15 @@ def translate(texts, engine: Union[
             err_msg = "{}: {}: Exception: {}".format(engine, -2, repr(e))
     else:
         return {'trans': texts}
+    
+    # 确保函数有返回值
+    if err_msg:
+        return {'error': err_msg}
+    elif rtn:
+        return rtn
+    else:
+        # 如果既没有错误信息也没有翻译结果，返回原始文本
+        return {'trans': texts}
 
 def baidu_translate(texts, app_id, api_key, to='zh'):
     """使用百度翻译文本（默认翻译为简体中文）"""
@@ -174,21 +190,56 @@ def google_trans(texts, to='zh_CN'):
     # API: https://www.jianshu.com/p/ce35d89c25c3
     # client参数的选择: https://github.com/lmk123/crx-selection-translate/issues/223#issue-184432017
     global _google_trans_wait
-    url = f"https://translate.google.com.hk/translate_a/single?client=gtx&dt=t&dj=1&ie=UTF-8&sl=auto&tl={to}&q={texts}"
+    
+    # 尝试不同的 Google 翻译域名
+    domains = ['translate.google.com.hk', 'translate.google.com.tw', 'translate.google.com']
+    
     proxies = read_proxy()
-    r = requests.get(url, proxies=proxies)
-    while r.status_code == 429:
-        logger.warning(f"HTTP {r.status_code}: {r.reason}: Google翻译请求超限，将等待{_google_trans_wait}秒后重试")
-        time.sleep(_google_trans_wait)
-        r = requests.get(url, proxies=proxies)
-        if r.status_code == 429:
-            _google_trans_wait += random.randint(60, 90)
-    if r.status_code == 200:
-        result = r.json()
+    last_exception = None
+    
+    for domain in domains:
+        url = f"https://{domain}/translate_a/single?client=gtx&dt=t&dj=1&ie=UTF-8&sl=auto&tl={to}&q={texts}"
+        
+        # 重试机制
+        for retry in range(3):  # 最多重试3次
+            try:
+                r = requests.get(url, proxies=proxies, timeout=30)
+                
+                # 处理 429 状态码（请求过多）
+                while r.status_code == 429:
+                    logger.warning(f"HTTP {r.status_code}: {r.reason}: Google翻译请求超限，将等待{_google_trans_wait}秒后重试")
+                    time.sleep(_google_trans_wait)
+                    r = requests.get(url, proxies=proxies, timeout=30)
+                    if r.status_code == 429:
+                        _google_trans_wait += random.randint(60, 90)
+                
+                if r.status_code == 200:
+                    result = r.json()
+                    time.sleep(4)  # Google翻译的API有QPS限制，因此需要等待一段时间
+                    return result
+                else:
+                    result = {'error_code': r.status_code, 'error_msg': r.reason}
+                    logger.warning(f"Google翻译失败 (域名: {domain}, 状态码: {r.status_code}): {r.reason}")
+                    break
+                    
+            except requests.exceptions.SSLError as e:
+                last_exception = e
+                logger.warning(f"Google翻译SSL错误 (域名: {domain}, 重试 {retry+1}/3): {e}")
+                if retry < 2:  # 如果不是最后一次重试，等待后重试
+                    time.sleep(2)
+                continue
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                logger.warning(f"Google翻译网络错误 (域名: {domain}, 重试 {retry+1}/3): {e}")
+                if retry < 2:
+                    time.sleep(2)
+                continue
+    
+    # 所有重试和域名都失败
+    if last_exception:
+        return {'error_code': -2, 'error_msg': f"SSL/网络错误: {last_exception}"}
     else:
-        result = {'error_code': r.status_code, 'error_msg': r.reason}
-    time.sleep(4) # Google翻译的API有QPS限制，因此需要等待一段时间
-    return result
+        return {'error_code': -1, 'error_msg': 'Google翻译失败'}
 
 def claude_translate(texts, api_key, to="zh_CN"):
     """使用Claude翻译文本（默认翻译为简体中文）"""

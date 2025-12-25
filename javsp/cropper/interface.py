@@ -17,8 +17,20 @@ class DefaultCropper(Cropper):
         (poster_w, poster_h) = \
             (int(fanart_h / ratio), fanart_h) \
             if fanart_h / fanart_w < ratio \
-            else (fanart_w, int(fanart_w * ratio)) # 图片太“瘦”时以宽度来定裁剪高度
+            else (fanart_w, int(fanart_w * ratio)) # 图片太"瘦"时以宽度来定裁剪高度
 
-        box = (poster_w - fanart_w, 0, poster_w, poster_h)
-        fanart.crop(box)
-        return fanart
+        # 计算裁切区域，默认选取右半部分
+        # 对于横幅图片，通常重要内容在右侧
+        left = fanart_w - poster_w
+        top = (fanart_h - poster_h) // 2
+        
+        # 确保裁切区域在图片范围内
+        left = max(0, left)
+        top = max(0, top)
+        right = left + poster_w
+        bottom = top + poster_h
+        right = min(fanart_w, right)
+        bottom = min(fanart_h, bottom)
+        
+        box = (left, top, right, bottom)
+        return fanart.crop(box)

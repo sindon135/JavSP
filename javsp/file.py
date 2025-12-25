@@ -58,7 +58,8 @@ def scan_movies(root: str) -> List[Movie]:
                     fail = Movie('无法识别番号')
                     fail.files = [fullpath]
                     failed_items.append(fail)
-                    logger.error(f"无法提取影片番号: '{fullpath}'")
+                    # 改为debug级别，避免输出过多错误信息
+                    logger.debug(f"无法提取影片番号: '{fullpath}'")
     # 多分片影片容易有文件大小低于阈值的子片，进行特殊处理
     has_avid = {}
     for name in list(small_videos.keys()):
@@ -91,37 +92,234 @@ def scan_movies(root: str) -> List[Movie]:
             non_slice_dup[avid] = files
             del dic[avid]
             continue
-        # 提取分片信息（如果正则替换成功，只会剩下单个小写字符）。相关变量都要使用同样的列表生成顺序
+        
+        # 特殊处理：动漫影片的多语言版本
+        # 检查是否是动漫影片（番号以ANIME:开头）
+        if avid.startswith('ANIME:'):
+            # 对于动漫影片，检查是否是不同语言版本（chs, cht等）
+            basenames = [os.path.basename(i) for i in files]
+            
+            # 检查文件名是否包含语言标记
+            language_patterns = [r'\.chs\.', r'\.cht\.', r'\.简中\.', r'\.繁中\.', r'\.简体\.', r'\.繁体\.']
+            has_language_versions = False
+            for pattern in language_patterns:
+                if any(re.search(pattern, name, re.I) for name in basenames):
+                    has_language_versions = True
+                    break
+            
+            # 检查是否是分片（包含CD, Part, 数字后缀等）
+            is_slice = False
+            slice_patterns = [
+                r'[-_\s]CD[-_\s]*\d',
+                r'[-_\s]Part[-_\s]*\d',
+                r'[-_\s]\d{1,3}\.',
+                r'[-_\s][A-Za-z]\.[a-zA-Z0-9]+$'
+            ]
+            for pattern in slice_patterns:
+                if any(re.search(pattern, name, re.I) for name in basenames):
+                    is_slice = True
+                    break
+            
+            # 如果是动漫多语言版本，保留所有文件
+            # 对于动漫多语言版本，直接接受，不进行分片识别
+            if has_language_versions and not is_slice:
+                logger.debug(f"识别为动漫多语言版本（非分片）: {avid}, 文件数: {len(files)}")
+                # 按语言版本排序：raw/mkv优先，然后chs，最后cht
+                def language_priority(filename):
+                    filename_lower = filename.lower()
+                    if '.mkv' in filename_lower and not any(p in filename_lower for p in ['.chs.', '.cht.', '.简中.', '.繁中.']):
+                        return 0  # raw版本
+                    elif '.chs.' in filename_lower or '.简中.' in filename_lower:
+                        return 1  # 简体中文
+                    elif '.cht.' in filename_lower or '.繁中.' in filename_lower:
+                        return 2  # 繁体中文
+                    else:
+                        return 3  # 其他
+                
+                files.sort(key=lambda x: language_priority(os.path.basename(x)))
+                dic[avid] = files
+                continue  # 跳过后续的分片识别逻辑
+        # 提取分片信息（改进版，支持多字符分片标识）
         basenames = [os.path.basename(i) for i in files]
         prefix = os.path.commonprefix(basenames)
-        try:
-            pattern_expr = re_escape(prefix) + r'\s*([a-z\d])\s*'
-            pattern = re.compile(pattern_expr, flags=re.I)
-        except re.error:
-            logger.debug(f"正则识别影片分片信息时出错: '{pattern_expr}'")
-            del dic[avid]
-            continue
-        remaining = [pattern.sub(r'\1', i).lower() for i in basenames]
-        postfixes = [i[1:] for i in remaining]
-        slices = [i[0] for i in remaining]
-        # 如果有不同的后缀，说明有文件名不符合正则表达式条件（没有发生替换或不带分片信息）
-        if (len(set(postfixes)) != 1
-            # remaining为初步提取的分片信息，不允许有重复值
-            or len(slices) != len(set(slices))):
-            logger.debug(f"无法识别分片信息: {prefix=}, {remaining=}")
+        
+        # 改进的正则表达式：支持多字符分片标识
+        patterns = [
+            # 模式1: 共同前缀后跟可选分隔符和数字（1-3位）
+            re_escape(prefix) + r'[-_\s]*(\d{1,3})',
+            # 模式2: 共同前缀后跟CD和数字
+            re_escape(prefix) + r'[-_\s]*CD[-_\s]*(\d{1,3})',
+            # 模式3: 共同前缀后跟单个字母
+            re_escape(prefix) + r'[-_\s]*([a-zA-Z])',
+            # 模式4: 共同前缀后跟part和数字
+            re_escape(prefix) + r'[-_\s]*PART[-_\s]*(\d{1,3})',
+        ]
+        
+        slice_numbers = []
+        postfixes = []
+        has_explicit_slice = [False] * len(basenames)
+        
+        # 第一遍：识别有明确分片标识的文件
+        for i, name in enumerate(basenames):
+            matched = False
+            for pattern in patterns:
+                try:
+                    match = re.search(pattern, name, re.I)
+                except re.error:
+                    logger.debug(f"正则识别影片分片信息时出错: '{pattern}'")
+                    continue
+                
+                if match:
+                    slice_id = match.group(1)
+                    # 提取剩余部分（分片标识之后的部分）
+                    remaining = name[match.end():]
+                    slice_numbers.append(slice_id)
+                    postfixes.append(remaining)
+                    has_explicit_slice[i] = True
+                    matched = True
+                    break
+            
+            if not matched:
+                # 暂时标记为None，第二遍处理
+                slice_numbers.append(None)
+                postfixes.append(None)
+        
+        # 第二遍：处理没有明确分片标识的文件
+        for i in range(len(basenames)):
+            if slice_numbers[i] is None:
+                name = basenames[i]
+                # 检查是否正好是共同前缀（没有分片标识）
+                if name.startswith(prefix):
+                    remaining = name[len(prefix):]
+                    # 检查是否已经有明确的分片1
+                    has_slice_1 = False
+                    for j in range(len(basenames)):
+                        if has_explicit_slice[j] and slice_numbers[j] == '1':
+                            has_slice_1 = True
+                            break
+                    
+                    if not has_slice_1:
+                        # 没有明确的分片1，假设这是分片1
+                        slice_numbers[i] = '1'
+                        postfixes[i] = remaining
+                        has_explicit_slice[i] = False  # 这是推断的，不是明确的
+                    else:
+                        # 已经有明确的分片1，这个文件无法识别
+                        logger.debug(f"无法识别分片信息: 文件 '{name}' 没有分片标识，但已有明确的分片1")
+                        slice_numbers[i] = None
+                        postfixes[i] = None
+                else:
+                    # 无法识别
+                    slice_numbers[i] = None
+                    postfixes[i] = None
+        
+        # 检查是否有None值
+        if any(x is None for x in slice_numbers):
+            # 对于动漫影片，如果没有分片标识，可能是多语言版本
+            # 为每个文件分配基于语言版本的标识符
+            if avid.startswith('ANIME:'):
+                logger.debug(f"动漫影片无分片标识，尝试按语言版本处理: {prefix=}")
+                # 重新分配slice_numbers基于语言版本
+                for i, name in enumerate(basenames):
+                    filename_lower = name.lower()
+                    if '.chs.' in filename_lower or '.简中.' in filename_lower:
+                        slice_numbers[i] = 'chs'
+                    elif '.cht.' in filename_lower or '.繁中.' in filename_lower:
+                        slice_numbers[i] = 'cht'
+                    elif '.mkv' in filename_lower and not any(p in filename_lower for p in ['.chs.', '.cht.', '.简中.', '.繁中.']):
+                        slice_numbers[i] = 'raw'
+                    else:
+                        slice_numbers[i] = f'file{i}'
+                
+                # 检查是否还有None值
+                if any(x is None for x in slice_numbers):
+                    logger.debug(f"无法识别分片信息: {prefix=}, {slice_numbers=}")
+                    non_slice_dup[avid] = files
+                    del dic[avid]
+                    continue
+            else:
+                logger.debug(f"无法识别分片信息: {prefix=}, {slice_numbers=}")
+                non_slice_dup[avid] = files
+                del dic[avid]
+                continue
+        
+        # 检查后缀是否一致
+        # 对于动漫影片，允许不同的语言版本后缀（.chs.mp4, .cht.mp4, .mkv等）
+        if len(set(postfixes)) != 1:
+            # 检查是否是动漫影片
+            if avid.startswith('ANIME:'):
+                # 对于动漫影片，检查后缀差异是否只是语言版本差异
+                # 提取所有后缀的文件扩展名部分
+                extensions = []
+                for postfix in postfixes:
+                    # 提取文件扩展名（最后一个点之后的部分）
+                    if '.' in postfix:
+                        ext = postfix[postfix.rfind('.'):].lower()
+                        extensions.append(ext)
+                    else:
+                        extensions.append('')
+                
+                # 检查扩展名是否都是视频格式
+                video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg']
+                all_video_ext = all(ext in video_extensions for ext in extensions)
+                
+                if all_video_ext:
+                    # 所有都是视频格式，可能是不同语言版本
+                    logger.debug(f"动漫影片允许不同的语言版本后缀: {set(postfixes)}")
+                else:
+                    logger.debug(f"无法识别分片信息: 后缀不一致 {set(postfixes)}")
+                    non_slice_dup[avid] = files
+                    del dic[avid]
+                    continue
+            else:
+                logger.debug(f"无法识别分片信息: 后缀不一致 {set(postfixes)}")
+                non_slice_dup[avid] = files
+                del dic[avid]
+                continue
+        
+        # 检查分片标识是否唯一
+        if len(slice_numbers) != len(set(slice_numbers)):
+            logger.debug(f"无法识别分片信息: 分片标识重复 {slice_numbers}")
             non_slice_dup[avid] = files
             del dic[avid]
             continue
-        # 影片编号必须从 0/1/a 开始且编号连续
-        sorted_slices = sorted(slices)
-        first, last = sorted_slices[0], sorted_slices[-1]
-        if (first not in ('0', '1', 'a')) or (ord(last) != (ord(first)+len(sorted_slices)-1)):
-            logger.debug(f"无效的分片起始编号或分片编号不连续: {sorted_slices=}")
-            non_slice_dup[avid] = files
-            del dic[avid]
-            continue
+        
+        # 转换分片标识为数字
+        numeric_slices = []
+        for s in slice_numbers:
+            if s.isdigit():
+                numeric_slices.append(int(s))
+            elif s.isalpha() and len(s) == 1:
+                # 字母转数字：a=1, b=2, ...
+                numeric_slices.append(ord(s.lower()) - ord('a') + 1)
+            else:
+                # 尝试提取数字部分（如CD10中的10）
+                num_match = re.search(r'(\d+)', s)
+                if num_match:
+                    numeric_slices.append(int(num_match.group(1)))
+                else:
+                    # 处理语言版本标识符（chs, cht, raw等）
+                    # 为语言版本分配固定的数字值
+                    if s.lower() == 'raw':
+                        numeric_slices.append(0)  # raw版本优先级最高
+                    elif s.lower() == 'chs':
+                        numeric_slices.append(1)  # 简体中文
+                    elif s.lower() == 'cht':
+                        numeric_slices.append(2)  # 繁体中文
+                    elif s.startswith('file'):
+                        # 文件标识符，提取数字部分
+                        file_num_match = re.search(r'file(\d+)', s.lower())
+                        if file_num_match:
+                            numeric_slices.append(int(file_num_match.group(1)) + 10)  # 从10开始
+                        else:
+                            numeric_slices.append(99)  # 默认值
+                    else:
+                        logger.debug(f"无法转换分片标识: {s}")
+                        non_slice_dup[avid] = files
+                        del dic[avid]
         # 生成最终的分片信息
-        mapped_files = [files[slices.index(i)] for i in sorted_slices]
+        sorted_indices = sorted(range(len(numeric_slices)), key=lambda i: numeric_slices[i])
+        mapped_files = [files[i] for i in sorted_indices]
         dic[avid] = mapped_files
 
     # 汇总输出错误提示信息

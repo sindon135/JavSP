@@ -51,6 +51,8 @@ class CrawlerSelect(BaseConfig):
             ('cid', self.cid),
             ('getchu', self.getchu),
             ('gyutto', self.gyutto),
+            ('anime', self.anime),
+            ('western', self.western),
         ]
 
     def __getitem__(self, index) -> list[CrawlerID]:
@@ -65,6 +67,10 @@ class CrawlerSelect(BaseConfig):
                 return self.getchu
             case 'gyutto':
                 return self.gyutto
+            case 'anime':
+                return self.anime
+            case 'western':
+                return self.western
         raise Exception("Unknown crawler type")
 
     normal: list[CrawlerID]
@@ -72,6 +78,8 @@ class CrawlerSelect(BaseConfig):
     cid: list[CrawlerID]
     getchu: list[CrawlerID]
     gyutto: list[CrawlerID]
+    anime: list[CrawlerID]
+    western: list[CrawlerID]
 
 class MovieInfoField(str, Enum):
     dvdid = 'dvdid'
@@ -212,10 +220,13 @@ class Other(BaseConfig):
     interactive: bool
     check_update: bool
     auto_update: bool
+    default_mode: str = 'auto'
 
 def get_config_source():
     parser = ArgumentParser(prog='JavSP', description='汇总多站点数据的AV元数据刮削器', formatter_class=RawTextHelpFormatter)
     parser.add_argument('-c', '--config', help='使用指定的配置文件')
+    parser.add_argument('--mode', choices=['auto', 'normal', 'anime', 'western'],
+                       default=None, help='刮削模式: auto(自动检测), normal(普通), anime(动漫), western(欧美)')
     args, _ = parser.parse_known_args()
     sources = []
     if args.config is None:
@@ -223,7 +234,7 @@ def get_config_source():
     sources.append(FileSource(file=args.config))
     sources.append(EnvSource(prefix='JAVSP_', allow_all=True))
     sources.append(CLArgSource(prefix='o'))
-    return sources
+    return args, sources
 
 class Cfg(BaseConfig):
     scanner: Scanner
@@ -232,4 +243,9 @@ class Cfg(BaseConfig):
     summarizer: Summarizer
     translator: Translator
     other: Other
-    CONFIG_SOURCES=get_config_source()
+    _args, CONFIG_SOURCES = get_config_source()
+    
+    @property
+    def mode_arg(self):
+        """获取命令行中的模式参数"""
+        return self._args.mode

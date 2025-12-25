@@ -112,29 +112,70 @@ def get_cookies(cookies_file, decrypter, host_pattern='javdb%.com'):
     # 复制Cookies文件到临时目录，避免直接操作原始的Cookies文件
     temp_dir = os.getenv('TMPDIR', os.getenv('TEMP', os.getenv('TMP', '.')))
     temp_cookie = os.path.join(temp_dir, 'Cookies')
-    copyfile(cookies_file, temp_cookie)
-    # 连接数据库进行查询
-    conn = sqlite3.connect(temp_cookie)
-    cursor = conn.cursor()
-    cursor.execute(f'SELECT host_key, name, encrypted_value, expires_utc FROM cookies WHERE host_key LIKE "{host_pattern}"')
-    # 将查询结果按照host_key进行组织
-    now = datetime.now()
-    records = {}
-    for host_key, name, encrypted_value, expires_utc in cursor.fetchall():
-        d = records.setdefault(host_key, {})
-        # 只提取尚在有效期内的Cookies
-        expires = convert_chrome_utc(expires_utc)
-        if expires > now:
-            d[name] = decrypter.decrypt(encrypted_value)
-    # Cookies的核心字段是'_jdb_session'，因此如果records中缺失此字段（说明已过期），则对应的Cookies不再有效
-    valid_records = {k: v for k, v in records.items() if '_jdb_session' in v}
-    conn.close()
-    os.remove(temp_cookie)
-    return valid_records
+    
+    # 尝试复制文件，如果失败则记录错误并返回空结果
+    try:
+        copyfile(cookies_file, temp_cookie)
+    except PermissionError as e:
+        logger.warning(f"无法复制Cookies文件，可能是浏览器正在运行或安全软件保护: {cookies_file}")
+        logger.warning(f"错误详情: {e}")
+        # 尝试直接读取原始文件（如果SQLite允许）
+        try:
+            # 直接连接原始文件（只读模式）
+            conn = sqlite3.connect(f'file:{cookies_file}?mode=ro', uri=True)
+            cursor = conn.cursor()
+            cursor.execute(f'SELECT host_key, name, encrypted_value, expires_utc FROM cookies WHERE host_key LIKE "{host_pattern}"')
+            
+            now = datetime.now()
+            records = {}
+            for host_key, name, encrypted_value, expires_utc in cursor.fetchall():
+                d = records.setdefault(host_key, {})
+                # 只提取尚在有效期内的Cookies
+                expires = convert_chrome_utc(expires_utc)
+                if expires > now:
+                    try:
+                        d[name] = decrypter.decrypt(encrypted_value)
+                    except Exception as decrypt_error:
+                        logger.debug(f"解密Cookies失败: {decrypt_error}")
+            
+            # Cookies的核心字段是'_jdb_session'，因此如果records中缺失此字段（说明已过期），则对应的Cookies不再有效
+            valid_records = {k: v for k, v in records.items() if '_jdb_session' in v}
+            conn.close()
+            return valid_records
+        except Exception as direct_error:
+            logger.warning(f"直接读取Cookies文件也失败: {direct_error}")
+            return {}
+        except sqlite3.OperationalError as sqlite_error:
+            logger.warning(f"SQLite操作错误: {sqlite_error}")
+            return {}
+    
+    # 正常流程：使用复制的文件
+    try:
+        conn = sqlite3.connect(temp_cookie)
+        cursor = conn.cursor()
+        cursor.execute(f'SELECT host_key, name, encrypted_value, expires_utc FROM cookies WHERE host_key LIKE "{host_pattern}"')
+        # 将查询结果按照host_key进行组织
+        now = datetime.now()
+        records = {}
+        for host_key, name, encrypted_value, expires_utc in cursor.fetchall():
+            d = records.setdefault(host_key, {})
+            # 只提取尚在有效期内的Cookies
+            expires = convert_chrome_utc(expires_utc)
+            if expires > now:
+                d[name] = decrypter.decrypt(encrypted_value)
+        # Cookies的核心字段是'_jdb_session'，因此如果records中缺失此字段（说明已过期），则对应的Cookies不再有效
+        valid_records = {k: v for k, v in records.items() if '_jdb_session' in v}
+        conn.close()
+        return valid_records
+    finally:
+        # 确保临时文件被清理
+        try:
+            os.remove(temp_cookie)
+        except:
+            pass
 
 
 if __name__ == "__main__":
     all_cookies = get_browsers_cookies()
     for d in all_cookies:
         print('{:<20}{}'.format(d['profile'], d['site']))
-

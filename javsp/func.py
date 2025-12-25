@@ -29,7 +29,7 @@ from javsp.lib import re_escape, resource_path
 from javsp.prompt import prompt
 
 __all__ = ['select_folder', 'get_scan_dir', 'remove_trail_actor_in_title',
-           'shutdown', 'CLEAR_LINE', 'check_update', 'split_by_punc']
+           'shutdown', 'CLEAR_LINE', 'check_update', 'split_by_punc', 'smart_truncate']
 
 
 CLEAR_LINE = '\r\x1b[K'
@@ -149,6 +149,57 @@ def split_by_punc(s):
     else:
         ls = [s]
     return ls
+
+
+def smart_truncate(text: str, max_len: int, add_ellipsis: str = '。') -> str:
+    """
+    智能截断文本，使其字节长度不超过max_len。
+    规则：
+    1. 如果长度 <= max_len，直接返回。
+    2. 否则，在max_len前（0到max_len-1）查找最后一个分隔符。
+    3. 分隔符包括：中文句号。，逗号，、，分号；，冒号：，感叹号！，问号？，破折号—，波浪号～，间隔号・，空格（全角和半角）。
+    4. 如果找到分隔符，截断到该位置（不包括分隔符），然后在末尾添加add_ellipsis。
+    5. 如果没有找到分隔符，则截断到max_len，然后在末尾添加add_ellipsis。
+    """
+    # 计算字节长度
+    byte_len = len(text.encode('utf-8'))
+    if byte_len <= max_len:
+        return text
+    # 分隔符集合
+    separators = '。，、；：！？—～・ 　'
+    # 将文本转换为字节数组以便按字节索引
+    bytes_text = text.encode('utf-8')
+    # 我们需要在字节索引范围内找到最后一个分隔符的字符边界
+    # 简化：从max_len-1开始向前搜索，直到找到分隔符字符的起始字节
+    # 由于UTF-8字符可能占用多个字节，我们需要确保不截断字符中间
+    # 我们将搜索范围限制在文本的字符边界内
+    # 首先，将字节数组解码为字符串，但只解码有效部分
+    # 更简单的方法：迭代字符并累积字节长度
+    current_byte_len = 0
+    last_sep_index = -1  # 字符索引
+    for i, ch in enumerate(text):
+        ch_byte_len = len(ch.encode('utf-8'))
+        if current_byte_len + ch_byte_len > max_len:
+            # 超过长度，停止
+            break
+        if ch in separators:
+            last_sep_index = i
+        current_byte_len += ch_byte_len
+    # 现在 current_byte_len 是最后一个完整字符的字节长度
+    if last_sep_index != -1:
+        # 截断到分隔符位置（不包括分隔符）
+        truncated = text[:last_sep_index]
+    else:
+        # 截断到最大字节长度对应的字符边界
+        # current_byte_len 已经是不超过max_len的最大字符字节长度
+        truncated = text[:i]  # i 是第一个导致超出的字符索引
+    # 添加省略号
+    truncated += add_ellipsis
+    # 确保添加后不超过max_len（可能省略号本身超长，但中文字符通常3字节，句号也是3字节）
+    # 简单起见，如果超长，移除省略号
+    if len(truncated.encode('utf-8')) > max_len:
+        truncated = truncated[:-len(add_ellipsis)]
+    return truncated
 
 
 def check_update(allow_check=True, auto_update=True):

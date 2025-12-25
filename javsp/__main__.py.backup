@@ -4,14 +4,12 @@ import sys
 import json
 import time
 import logging
-import argparse
 from PIL import Image
 from pydantic import ValidationError
 from pydantic_extra_types.pendulum_dt import Duration
 import requests
 import threading
 from typing import Dict, List
-from enum import Enum
 
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -46,9 +44,8 @@ from javsp.datatype import Movie, MovieInfo
 from javsp.web.base import download
 from javsp.web.exceptions import *
 from javsp.web.translate import translate_movie_info
-from javsp.avid import guess_av_type
 
-from javsp.config import Cfg, CrawlerID, UseJavDBCover
+from javsp.config import Cfg, CrawlerID
 from javsp.prompt import prompt
 
 actressAliasMap = {}
@@ -221,38 +218,21 @@ def info_summary(movie: Movie, all_info: Dict[str, MovieInfo]):
                 final_info.cid = final_id
     # javdb封面有水印，优先采用其他站点的封面
     javdb_cover = getattr(all_info.get('javdb'), 'cover', None)
-    javdb_big_cover = getattr(all_info.get('javdb'), 'big_cover', None)
-    
-    # 处理普通封面
-    if javdb_cover is not None and javdb_cover in covers:
+    if javdb_cover is not None:
         match Cfg().crawler.use_javdb_cover:
             case UseJavDBCover.fallback:
                 covers.remove(javdb_cover)
                 covers.append(javdb_cover)
             case UseJavDBCover.no:
                 covers.remove(javdb_cover)
-    
-    # 处理高清封面
-    if javdb_big_cover is not None:
-        match Cfg().crawler.use_javdb_cover:
-            case UseJavDBCover.fallback:
-                if javdb_big_cover in big_covers:
-                    big_covers.remove(javdb_big_cover)
-                    big_covers.append(javdb_big_cover)
-            case UseJavDBCover.no:
-                if javdb_big_cover in big_covers:
-                    big_covers.remove(javdb_big_cover)
 
     setattr(final_info, 'covers', covers)
     setattr(final_info, 'big_covers', big_covers)
     # 对cover和big_cover赋值，避免后续检查必须字段时出错
-    # 优先使用高清封面作为默认封面
+    if covers:
+        final_info.cover = covers[0]
     if big_covers:
         final_info.big_cover = big_covers[0]
-        final_info.cover = big_covers[0]  # 如果有高清封面，优先使用高清封面
-    elif covers:
-        final_info.cover = covers[0]
-        final_info.big_cover = None
     ########## 部分字段放在最后进行检查 ##########
     # 特殊的 genre
     if final_info.genre is None:
@@ -297,17 +277,8 @@ def generate_names(movie: Movie):
     for k, v in d.items():
         d[k] = replace_illegal_chars(v.strip())
 
-    # 判断影片类型
-    avid = info.dvdid or info.cid
-    av_type = guess_av_type(avid)
-    
     # 生成nfo文件中的影片标题
-    # 对于欧美电影，使用原始英文标题，忽略配置里的设置
-    if av_type == 'western':
-        # 使用原始标题作为nfo标题
-        nfo_title = info.ori_title or d['title']
-    else:
-        nfo_title = Cfg().summarizer.nfo.title_pattern.format(**d)
+    nfo_title = Cfg().summarizer.nfo.title_pattern.format(**d)
     setattr(info, 'nfo_title', nfo_title)
     
     # 使用字典填充模板，生成相关文件的路径（多分片影片要考虑CD-x部分）
@@ -323,117 +294,6 @@ def generate_names(movie: Movie):
     copyd = d.copy()
     copyd['num'] = copyd['num'] + movie.attr_str
     longest_ext = max((os.path.splitext(i)[1] for i in movie.files), key=len)
-    
-    # 对于anime和western类型，使用简单的番号+标题格式
-    if av_type in ['anime', 'western']:
-        # 简化命名：番号 + 标题
-        # 使用原始的番号（info.dvdid）而不是处理后的copyd['num']
-        raw_avid = info.dvdid or info.cid
-        
-        # 清理番号：移除前缀如WESTERN:或ANIME:厂商:
-        clean_num = raw_avid
-        if av_type == 'western' and clean_num.startswith('WESTERN:'):
-            clean_num = clean_num[8:]  # 移除WESTERN:前缀
-            # 对于欧美番号，使用原始文件名中的番号部分（如rkprime.25.11.18）
-            # 而不是完整的带标题的字符串
-            if '.' in clean_num:
-                # 取前四个部分：系列.日期.日期.演员
-                parts = clean_num.split('.')
-                if len(parts) >= 4:
-                    # 取前四个部分：系列.日期.日期.演员
-                    clean_num = '.'.join(parts[:4])
-                elif len(parts) >= 3:
-                    # 如果没有演员部分，只取前三个部分
-                    clean_num = '.'.join(parts[:3])
-        elif av_type == 'anime' and clean_num.startswith('ANIME:'):
-            # 提取厂商和标题部分
-            parts = clean_num.split(':', 2)
-            if len(parts) >= 3:
-                # ANIME:厂商:标题 -> 使用厂商作为番号前缀
-                studio = parts[1]
-                title_part = parts[2]
-                # 尝试从标题中提取番号（如GLOD-305）
-                anime_id_match = re.search(r'([A-Z]{2,10}[-_]\d{2,5})', title_part)
-                if anime_id_match:
-                    clean_num = anime_id_match.group(1)
-                else:
-                    # 如果没有找到标准番号，使用厂商作为前缀
-                    clean_num = studio
-            else:
-                clean_num = clean_num[6:]  # 移除ANIME:前缀
-        
-        # 构建简单的文件名：番号 + 标题
-        # 对于anime和western类型，使用原始标题（ori_title）而不是可能被翻译的标题
-        # 优先使用原始标题，如果原始标题不存在，则使用标题
-        # 对于动漫，特别处理：使用原始日文标题，避免翻译
-        if av_type == 'anime':
-            # 对于动漫，优先使用ori_title，如果不存在则使用rawtitle
-            title = info.ori_title or d['rawtitle']
-        else:
-            title = info.ori_title or d['title']
-        
-        # 对于动漫，文件名必须包含番号（用户要求：文件名需要用带番号的未翻译标题）
-        # 使用实际的番号（如JDXA-57665），而不是清理后的番号
-        actual_num = info.dvdid or info.cid
-        if av_type == 'anime':
-            # 确保番号是大写的
-            actual_num_upper = actual_num.upper()
-            # 如果标题已经包含番号，则只使用标题
-            if actual_num_upper in title.upper():
-                simple_name = title
-            else:
-                simple_name = f"{actual_num_upper} {title}"
-        else:
-            # 对于其他类型，使用原有的逻辑
-            if av_type == 'western' and clean_num in title:
-                simple_name = title
-            else:
-                simple_name = f"{clean_num} {title}"
-        
-        simple_name = replace_illegal_chars(simple_name.strip())
-        
-        if Cfg().summarizer.move_files:
-            # 根据类型使用不同的输出文件夹
-            if av_type == 'western':
-                save_dir = os.path.normpath(f"Western/{simple_name}").strip()
-            elif av_type == 'anime':
-                save_dir = os.path.normpath(f"Anime/{simple_name}").strip()
-            else:
-                # 其他类型使用配置文件中的路径模板
-                # 这里需要构建一个临时的字典来填充模板
-                temp_dict = {'num': clean_num, 'title': title, 'rawtitle': title}
-                save_dir = os.path.normpath(Cfg().summarizer.path.output_folder_pattern.format(**temp_dict)).strip()
-            basename = simple_name
-        else:
-            # 如果不整理文件，则保存抓取的数据到当前目录
-            save_dir = os.path.dirname(movie.files[0])
-            filebasename = os.path.basename(movie.files[0])
-            ext = os.path.splitext(filebasename)[1]
-            basename = filebasename.replace(ext, '')
-        
-        movie.save_dir = save_dir
-        movie.basename = basename
-        
-        # 根据视频是否分段选择不同的命名模式
-        if len(movie.files) > 1:
-            # 分段视频使用通用模式
-            nfo_name = "movie"
-            fanart_name = "fanart"
-            poster_name = "poster"
-        else:
-            # 单文件使用番号模式
-            nfo_name = basename
-            fanart_name = basename + "-fanart"
-            poster_name = basename + "-poster"
-        
-        movie.nfo_file = os.path.join(save_dir, nfo_name + '.nfo')
-        movie.fanart_file = os.path.join(save_dir, fanart_name + '.jpg')
-        movie.poster_file = os.path.join(save_dir, poster_name + '.jpg')
-        
-        logger.info(f"使用简化命名规则 ({av_type}): {simple_name}")
-        return
-    
-    # 对于其他类型，使用原有的复杂命名逻辑
     for end in range(len(ori_title_break), 0, -1):
         copyd['rawtitle'] = replace_illegal_chars(''.join(ori_title_break[:end]).strip())
         for sub_end in range(len(title_break), 0, -1):
@@ -452,48 +312,18 @@ def generate_names(movie: Movie):
             if remaining > 0:
                 movie.save_dir = save_dir
                 movie.basename = basename
-                
-                # 根据视频是否分段选择不同的命名模式
-                if len(movie.files) > 1:
-                    # 分段视频使用通用模式
-                    nfo_name = "movie"
-                    fanart_name = "fanart"
-                    poster_name = "poster"
-                else:
-                    # 单文件使用番号模式
-                    nfo_name = "{num}".format(**copyd)
-                    fanart_name = "{num}-fanart".format(**copyd)
-                    poster_name = "{num}-poster".format(**copyd)
-                
-                movie.nfo_file = os.path.join(save_dir, nfo_name + '.nfo')
-                movie.fanart_file = os.path.join(save_dir, fanart_name + '.jpg')
-                movie.poster_file = os.path.join(save_dir, poster_name + '.jpg')
-                
+                movie.nfo_file = os.path.join(save_dir, Cfg().summarizer.nfo.basename_pattern.format(**copyd) + '.nfo')
+                movie.fanart_file = os.path.join(save_dir, Cfg().summarizer.fanart.basename_pattern.format(**copyd) + '.jpg')
+                movie.poster_file = os.path.join(save_dir, Cfg().summarizer.cover.basename_pattern.format(**copyd) + '.jpg')
                 if d['title'] != copyd['title']:
                     logger.info(f"自动截短标题为:\n{copyd['title']}")
                 if d['rawtitle'] != copyd['rawtitle']:
                     logger.info(f"自动截短原始标题为:\n{copyd['rawtitle']}")
                 return
     else:
-        # 当整理路径非常深或者标题起始很长一段没有标点符号时，使用智能截短生成的名称
-        # remaining 是负数，表示超出多少字节
-        excess = -remaining
-        # 对 rawtitle 进行智能截断
-        rawtitle_bytes = len(copyd['rawtitle'].encode('utf-8'))
-        if rawtitle_bytes > excess:
-            # 截断到 rawtitle_bytes - excess 字节
-            max_len = rawtitle_bytes - excess
-            copyd['rawtitle'] = smart_truncate(copyd['rawtitle'], max_len)
-        else:
-            # rawtitle 太短，无法减少足够字节，可能需要同时截断 title
-            copyd['rawtitle'] = smart_truncate(copyd['rawtitle'], 1)  # 至少保留一个字符
-        # 对 title 进行智能截断
-        title_bytes = len(copyd['title'].encode('utf-8'))
-        if title_bytes > excess:
-            max_len = title_bytes - excess
-            copyd['title'] = smart_truncate(copyd['title'], max_len)
-        else:
-            copyd['title'] = smart_truncate(copyd['title'], 1)
+        # 以防万一，当整理路径非常深或者标题起始很长一段没有标点符号时，硬性截短生成的名称
+        copyd['title'] = copyd['title'][:remaining]
+        copyd['rawtitle'] = copyd['rawtitle'][:remaining]
         # 如果不整理文件，则保存抓取的数据到当前目录
         if not Cfg().summarizer.move_files:
             save_dir = os.path.dirname(movie.files[0])
@@ -506,21 +336,9 @@ def generate_names(movie: Movie):
         movie.save_dir = save_dir
         movie.basename = basename
 
-        # 根据视频是否分段选择不同的命名模式
-        if len(movie.files) > 1:
-            # 分段视频使用通用模式
-            nfo_name = "movie"
-            fanart_name = "fanart"
-            poster_name = "poster"
-        else:
-            # 单文件使用番号模式
-            nfo_name = "{num}".format(**copyd)
-            fanart_name = "{num}-fanart".format(**copyd)
-            poster_name = "{num}-poster".format(**copyd)
-        
-        movie.nfo_file = os.path.join(save_dir, nfo_name + '.nfo')
-        movie.fanart_file = os.path.join(save_dir, fanart_name + '.jpg')
-        movie.poster_file = os.path.join(save_dir, poster_name + '.jpg')
+        movie.nfo_file = os.path.join(save_dir, Cfg().summarizer.nfo.basename_pattern.format(**copyd) + '.nfo')
+        movie.fanart_file = os.path.join(save_dir, Cfg().summarizer.fanart.basename_pattern.format(**copyd) + '.jpg')
+        movie.poster_file = os.path.join(save_dir, Cfg().summarizer.cover.basename_pattern.format(**copyd) + '.jpg')
 
         if d['title'] != copyd['title']:
             logger.info(f"自动截短标题为:\n{copyd['title']}")
@@ -566,8 +384,8 @@ UNCENSORED_MARK_FILE = Image.open(os.path.abspath(resource_path('image/unc_mark.
 def process_poster(movie: Movie):
     def should_use_ai_crop_match(label):
         for r in Cfg().summarizer.cover.crop.on_id_pattern:
-            if re.match(r, label):
-                return True
+            re.match(r, label)
+            return True
         return False
     crop_engine = None
     if (movie.info.uncensored or
@@ -626,7 +444,7 @@ def RunNormalMode(all_movies):
             generate_names(movie)
             check_step(movie.save_dir, '无法按命名规则生成目标文件夹')
             if not os.path.exists(movie.save_dir):
-                os.makedirs(movie.save_dir, exist_ok=True)
+                os.makedirs(movie.save_dir)
 
             inner_bar.set_description('下载封面图片')
             if Cfg().summarizer.cover.highres:
@@ -653,7 +471,7 @@ def RunNormalMode(all_movies):
                 inner_bar.set_description('下载剧照')
                 if movie.info.preview_pics:
                     extrafanartdir = movie.save_dir + '/extrafanart'
-                    os.makedirs(extrafanartdir, exist_ok=True)
+                    os.mkdir(extrafanartdir)
                     for (id, pic_url) in enumerate(movie.info.preview_pics):
                         inner_bar.set_description(f"Downloading extrafanart {id} from url: {pic_url}")
                                                                                                                                 
@@ -741,85 +559,6 @@ def get_pic_path(fanart_path, url):
     pic_path = fanart_base + "." + pic_extend
     return pic_path
 
-class ScrapeMode(Enum):
-    """刮削模式枚举"""
-    AUTO = 'auto'      # 自动检测
-    NORMAL = 'normal'  # 普通模式
-    ANIME = 'anime'    # 动漫模式
-    WESTERN = 'western' # 欧美模式
-
-
-def select_scrape_mode():
-    """选择刮削模式"""
-    # 确定模式：优先使用命令行参数，其次使用配置文件中的默认值
-    mode_arg = Cfg().mode_arg
-    if mode_arg:
-        mode = ScrapeMode(mode_arg)
-    else:
-        # 从配置文件中获取默认模式
-        config_mode = Cfg().other.default_mode
-        if config_mode in ['auto', 'normal', 'anime', 'western']:
-            mode = ScrapeMode(config_mode)
-        else:
-            mode = ScrapeMode.AUTO
-    
-    # 如果模式是auto，但在交互模式下，可以提示用户选择
-    if mode == ScrapeMode.AUTO and Cfg().other.interactive:
-        print("\n请选择刮削模式:")
-        print("1. 自动检测 (根据文件名自动判断)")
-        print("2. 普通模式 (普通AV)")
-        print("3. 动漫模式 (动漫AV)")
-        print("4. 欧美模式 (欧美AV)")
-        
-        choice = prompt("请输入选择 (1-4, 默认1): ", "模式选择")
-        if choice == '2':
-            mode = ScrapeMode.NORMAL
-        elif choice == '3':
-            mode = ScrapeMode.ANIME
-        elif choice == '4':
-            mode = ScrapeMode.WESTERN
-        else:
-            mode = ScrapeMode.AUTO
-    
-    logger.info(f"使用刮削模式: {mode.value}")
-    return mode
-
-
-def filter_movies_by_mode(movies, mode):
-    """根据模式过滤影片列表"""
-    if mode == ScrapeMode.AUTO:
-        # 自动模式：不进行过滤，使用原有的guess_av_type逻辑
-        return movies
-    elif mode == ScrapeMode.NORMAL:
-        # 普通模式：处理所有影片，不进行动漫判断
-        # 根据用户反馈，普通模式下应该处理所有影片，包括可能被识别为动漫的影片
-        return movies
-    elif mode == ScrapeMode.ANIME:
-        # 动漫模式：只处理动漫
-        filtered = []
-        for movie in movies:
-            avid = movie.dvdid or movie.cid
-            av_type = guess_av_type(avid)
-            if av_type == 'anime':
-                filtered.append(movie)
-            else:
-                logger.debug(f"跳过非动漫影片 (模式={mode.value}): {avid} ({av_type})")
-        return filtered
-    elif mode == ScrapeMode.WESTERN:
-        # 欧美模式：只处理欧美影片
-        filtered = []
-        for movie in movies:
-            avid = movie.dvdid or movie.cid
-            av_type = guess_av_type(avid)
-            if av_type == 'western':
-                filtered.append(movie)
-            else:
-                logger.debug(f"跳过非欧美影片 (模式={mode.value}): {avid} ({av_type})")
-        return filtered
-    
-    return movies
-
-
 def error_exit(success, err_info):
     """检查业务逻辑是否成功完成，如果失败则报错退出程序"""
     if not success:
@@ -846,10 +585,6 @@ def entry():
     version_info = 'JavSP ' + getattr(sys, 'javsp_version', '未知版本/从代码运行')
     logger.debug(version_info.center(60, '='))
     check_update(Cfg().other.check_update, Cfg().other.auto_update)
-    
-    # 选择刮削模式
-    mode = select_scrape_mode()
-    
     root = get_scan_dir(Cfg().scanner.input_directory)
     error_exit(root, '未选择要扫描的文件夹')
     # 导入抓取器，必须在chdir之前
@@ -862,26 +597,7 @@ def entry():
     recognize_fail = []
     error_exit(movie_count, '未找到影片文件')
     logger.info(f'扫描影片文件：共找到 {movie_count} 部影片')
-    
-    # 根据模式过滤影片
-    filtered_movies = filter_movies_by_mode(recognized, mode)
-    filtered_count = len(filtered_movies)
-    
-    if filtered_count < movie_count:
-        logger.info(f"根据模式 '{mode.value}' 过滤后，剩余 {filtered_count} 部影片")
-        if filtered_count == 0:
-            # 提供更友好的提示信息
-            if mode == ScrapeMode.ANIME:
-                logger.warning(f"没有找到动漫影片。请检查：")
-                logger.warning(f"1. 文件名是否包含动漫关键词（如ANIMATION、OVA、THE ANIMATION等）")
-                logger.warning(f"2. 文件名是否包含动漫厂商（如Queen Bee、ピンクパイナップル、nur、魔人等）")
-                logger.warning(f"3. 文件名是否包含日文字符")
-                logger.warning(f"4. 是否选择了正确的刮削模式")
-            else:
-                logger.warning(f"没有符合模式 '{mode.value}' 的影片，程序退出")
-            sys.exit(0)
-    
-    RunNormalMode(filtered_movies + recognize_fail)
+    RunNormalMode(recognized + recognize_fail)
 
     sys.exit(0)
 

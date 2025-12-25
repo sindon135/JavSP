@@ -13,10 +13,12 @@ def write_nfo(info: MovieInfo, nfo_file):
     nfo = E.movie()
     dic = info.get_info_dic()
 
-    if info.nfo_title:
-        nfo.append(E.title(info.nfo_title))
-    else:
-        nfo.append(E.title(info.title))
+    # 确保标题中的番号使用大写字母
+    title_to_use = info.nfo_title if info.nfo_title else info.title
+    if info.dvdid and title_to_use.lower().startswith(info.dvdid.lower()):
+        # 替换番号部分为大写
+        title_to_use = info.dvdid.upper() + title_to_use[len(info.dvdid):]
+    nfo.append(E.title(title_to_use))
 
     # 仅在标题被处理过时'ori_title'字段才会有值
     if info.ori_title:
@@ -46,10 +48,11 @@ def write_nfo(info: MovieInfo, nfo_file):
     nfo.append(E.mpaa('NC-17'))     # 分级
 
     # 将DVD ID和CID写入到uniqueid字段
+    # 确保番号使用大写字母
     if info.dvdid:
-        nfo.append(E.uniqueid(info.dvdid, type='num', default='true'))
+        nfo.append(E.uniqueid(info.dvdid.upper(), type='num', default='true'))
     if info.cid:
-        nfo.append(E.uniqueid(info.cid, type='cid'))
+        nfo.append(E.uniqueid(info.cid.upper(), type='cid'))
 
     # 选择要写入的genre数据源字段：将[]作为后备结果，以确保genre结果为None时后续不会抛出异常
     for genre_item in (info.genre_norm, info.genre, []):

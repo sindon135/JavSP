@@ -174,7 +174,8 @@ class Movie:
             abs_dst = os.path.abspath(dst)
             # shutil.move might overwrite dst file
             if os.path.exists(abs_dst):
-                raise FileExistsError(f'File exists: {abs_dst}')
+                logger.warning(f"目标文件已存在，跳过移动: '{abs_dst}'")
+                return  # 跳过而不是抛出异常
             if (use_hardlink):
                 os.link(src, abs_dst)
             else:
@@ -199,6 +200,50 @@ class Movie:
                 newpath = os.path.join(self.save_dir, self.basename + f'-CD{i}' + ext)
                 move_file(fullpath, newpath)
                 new_paths.append(newpath)
+        
+        # 移动同名字幕文件
+        # 获取视频文件的原始目录
+        video_dir = os.path.dirname(self.files[0])
+        
+        # 方法1：查找与视频文件同名的字幕文件（相同的basename，不同的扩展名）
+        # 这对于初始状态视频和字幕文件名完全一样的情况最有效
+        for fullpath in self.files:
+            video_basename = os.path.splitext(os.path.basename(fullpath))[0]
+            video_dir = os.path.dirname(fullpath)
+            
+            # 查找同名字幕文件
+            for ext in ['.srt', '.ass', '.ssa', '.sub']:
+                sub_file = os.path.join(video_dir, video_basename + ext)
+                if os.path.exists(sub_file):
+                    # 构建字幕文件的新路径
+                    sub_newpath = os.path.join(self.save_dir, self.basename + ext)
+                    try:
+                        move_file(sub_file, sub_newpath)
+                        logger.info(f"已移动字幕文件: '{os.path.basename(sub_file)}' -> '{os.path.basename(sub_newpath)}'")
+                    except Exception as e:
+                        logger.warning(f"移动字幕文件失败: {e}")
+                    break  # 找到一个字幕文件后就停止查找
+        
+        # 方法2：如果方法1没有找到，使用原来的find_subtitle_in_dir函数
+        # 获取影片的番号（dvdid）
+        dvdid = self.info.dvdid if self.info else self.dvdid
+        
+        if dvdid:
+            # 导入find_subtitle_in_dir函数
+            from javsp.file import find_subtitle_in_dir
+            
+            # 查找匹配的字幕文件
+            sub_file = find_subtitle_in_dir(video_dir, dvdid)
+            if sub_file:
+                # 构建字幕文件的新路径
+                sub_ext = os.path.splitext(sub_file)[1]
+                sub_newpath = os.path.join(self.save_dir, self.basename + sub_ext)
+                try:
+                    move_file(sub_file, sub_newpath)
+                    logger.info(f"已移动字幕文件（通过番号匹配）: '{os.path.basename(sub_file)}' -> '{os.path.basename(sub_newpath)}'")
+                except Exception as e:
+                    logger.warning(f"移动字幕文件失败: {e}")
+        
         self.new_paths = new_paths
         if len(os.listdir(dir)) == 0:
             #如果移动文件后目录为空则删除该目录
